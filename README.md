@@ -198,3 +198,6 @@ generation, Bicep IaC (the dev provisioning is currently a manual checklist,
 and a threat model. The [SCOPE](docs/SCOPE.md) document holds the full v1 vision;
 [future_improvements](docs/future_improvements.md) sketches the next steps; this README
 reflects what is actually implemented.
+
+## Demo walkthrough
+https://www.linkedin.com/feed/update/urn:li:ugcPost:7475616342314995712/
