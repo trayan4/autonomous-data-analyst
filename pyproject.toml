@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-data-analyst"
+version = "0.5.0"
+description = "A multi-agent LangGraph reference architecture on Azure: validated text-to-SQL, root-cause diagnosis, an entitlement guardrail, tiered models, and OpenTelemetry observability."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Trayan Das" }]
+
+# Core runtime: what the agent graph needs to answer questions. Deliberately lean -
+# DB drivers, data-generation, and Azure export are opt-in extras below.
+dependencies = [
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "sqlglot>=25.0",
+    "openai>=1.40",
+    "langgraph>=0.2",
+    "opentelemetry-sdk>=1.20",
+]
+
+[project.optional-dependencies]
+# Live Azure SQL execution (executor imports pyodbc lazily, so it's not needed offline).
+db = ["pyodbc>=5.0"]
+# Synthetic data generation + bulk load tooling.
+data = ["numpy>=1.26", "pandas>=2.0", "faker>=24.0", "pyodbc>=5.0"]
+# Azure export beta (ADA_TRACE=azure). Pre-release only.
+azure = ["azure-monitor-opentelemetry-exporter>=1.0.0b53"]
+# FastAPI web surface (ada-serve).
+api = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+# Hybrid few-shot retrieval (ADA_RETRIEVER=hybrid): BM25 + dense vectors.
+retrieval = ["rank-bm25>=0.2.2", "faiss-cpu>=1.7", "numpy>=1.26"]
+
+[project.scripts]
+ada-eval = "ada.eval.run_eval:main"
+ada-ask = "ada.orchestrator.graph:main"
+ada-serve = "ada.api.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"ada.semantic" = ["*.yaml"]
+"ada.eval" = ["*.yaml"]
+"ada.data" = ["*.sql"]

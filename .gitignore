@@ -1,0 +1,28 @@
+# secrets / local config
+.env
+*.env
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# packaging build artifacts
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# data artifacts
+*.csv
+*.parquet
+data/raw/
+
+# embedding cache
+data/index/
+*.npz
+
+# macOS
+.DS_Store

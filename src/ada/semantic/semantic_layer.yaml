@@ -1,0 +1,632 @@
+version: 1
+dialect: azure-sql          # production target (T-SQL). query_examples are in this dialect.
+description: >
+  Semantic layer for the Autonomous Data Analyst e-commerce warehouse. It is the
+  single source of truth the Data Retrieval agent reads to generate safe, correct
+  SQL (schema-RAG + few-shot, per ADR-0003) and the allow-list the SQL validator
+  enforces. Metric definitions are canonical: the agent must use these, not invent
+  its own.
+
+policy:
+  read_only: true                  # only SELECT is ever allowed
+  default_row_limit: 10000         # validator injects a row cap if none is present
+  pii_requires_entitlement: true   # columns with pii: true are gated by RBAC (UC-C)
+  allowed_schemas: [dbo]
+  pii_columns: [customers.full_name, customers.email, customers.phone]
+
+tables:
+  order_items:
+    grain: one row per order line item
+    description: Line-item fact table. Primary fact for revenue / GMV analysis.
+    row_estimate: 518000
+    primary_key: order_item_id
+    columns:
+      order_item_id: { type: int, description: surrogate key }
+      order_id:      { type: int, description: FK to orders.order_id }
+      product_id:    { type: int, description: FK to products.product_id }
+      category:      { type: string, description: product category (denormalised), enum: [Electronics, Apparel, Home, Beauty, Sports] }
+      region:        { type: string, description: sales region (denormalised from order), enum: [North, South, East, West] }
+      channel:       { type: string, description: acquisition channel (denormalised), enum: [Paid Search, Organic, Email, Social, Direct] }
+      order_date:    { type: date, description: date the parent order was placed }
+      quantity:      { type: int, description: units in this line }
+      unit_price:    { type: decimal, description: price per unit at time of sale }
+      discount:      { type: decimal, description: fractional discount, 0..0.2 }
+      line_gmv:      { type: decimal, description: "net line revenue = quantity * unit_price * (1 - discount)" }
+
+  orders:
+    grain: one row per order
+    description: Order header. Use for order counts and order status (returns).
+    primary_key: order_id
+    columns:
+      order_id:    { type: int, description: surrogate key }
+      customer_id: { type: int, description: FK to customers.customer_id }
+      order_date:  { type: date, description: date the order was placed }
+      region:      { type: string, enum: [North, South, East, West] }
+      channel:     { type: string, enum: [Paid Search, Organic, Email, Social, Direct] }
+      status:      { type: string, description: order outcome, enum: [completed, returned, cancelled] }
+
+  customers:
+    grain: one row per customer
+    description: Customer dimension. Contains PII (see policy.pii_columns).
+    primary_key: customer_id
+    columns:
+      customer_id: { type: int, description: surrogate key }
+      full_name:   { type: string, description: customer name, pii: true }
+      email:       { type: string, description: contact email, pii: true }
+      phone:       { type: string, description: contact phone, pii: true }
+      region:      { type: string, enum: [North, South, East, West] }
+      segment:     { type: string, description: lifecycle segment, enum: [New, Returning, VIP] }
+      signup_date: { type: date, description: account creation date }
+
+  products:
+    grain: one row per product
+    primary_key: product_id
+    columns:
+      product_id:  { type: int, description: surrogate key }
+      category:    { type: string, enum: [Electronics, Apparel, Home, Beauty, Sports] }
+      subcategory: { type: string, description: product subcategory }
+      unit_price:  { type: decimal, description: list price }
+
+  marketing_spend:
+    grain: one row per month x region x channel
+    description: Monthly paid-marketing spend. Conformed on region/channel/month.
+    columns:
+      month:   { type: date, description: first day of the month }
+      region:  { type: string, enum: [North, South, East, West] }
+      channel: { type: string, enum: [Paid Search, Organic, Email, Social, Direct] }
+      spend:   { type: decimal, description: marketing spend for the month }
+
+  inventory_snapshots:
+    grain: one row per day x region x category
+    description: Daily inventory level. units_in_stock = 0 indicates a stockout.
+    columns:
+      snapshot_date:  { type: date, description: snapshot day }
+      region:         { type: string, enum: [North, South, East, West] }
+      category:       { type: string, enum: [Electronics, Apparel, Home, Beauty, Sports] }
+      units_in_stock: { type: int, description: units on hand; 0 = stockout }
+
+relationships:
+  - { from: order_items.order_id,    to: orders.order_id,        type: many_to_one }
+  - { from: order_items.product_id,  to: products.product_id,    type: many_to_one }
+  - { from: orders.customer_id,      to: customers.customer_id,  type: many_to_one }
+  # marketing_spend and inventory_snapshots join to facts on conformed dimensions
+  # (region, channel/category, and the matching time grain), not on hard keys.
+
+metrics:
+  gmv:
+    label: GMV (net revenue)
+    table: order_items
+    expression: SUM(line_gmv)
+    description: Net merchandise value. The default "sales" / "revenue" measure.
+    synonyms: [revenue, sales, net sales, turnover]
+  gross_revenue:
+    table: order_items
+    expression: SUM(quantity * unit_price)
+    description: Revenue before discounts.
+  units_sold:
+    table: order_items
+    expression: SUM(quantity)
+    synonyms: [units, volume]
+  order_count:
+    table: orders
+    expression: COUNT(DISTINCT order_id)
+    synonyms: [orders, number of orders]
+  aov:
+    label: Average Order Value
+    table: order_items
+    expression: SUM(line_gmv) / COUNT(DISTINCT order_id)
+    description: GMV per order.
+    synonyms: [average order value, basket size]
+  return_rate:
+    table: orders
+    expression: "AVG(CASE WHEN status = 'returned' THEN 1.0 ELSE 0 END)"
+    description: >
+      Share of orders with status 'returned'. CAVEAT: in the synthetic data,
+      status is assigned at random, so this metric has no real driver structure.
+  marketing_spend_total:
+    table: marketing_spend
+    expression: SUM(spend)
+    synonyms: [ad spend, marketing spend]
+  roas:
+    label: Return on Ad Spend
+    cross_table: true
+    description: >
+      GMV / marketing spend for the same region/channel/period. Cross-table:
+      aggregate GMV and spend separately, then divide (avoid join fan-out).
+    expression: "SUM(order_items.line_gmv) / NULLIF(SUM(marketing_spend.spend), 0)"
+
+dimensions:
+  region:   { enum: [North, South, East, West] }
+  category: { enum: [Electronics, Apparel, Home, Beauty, Sports] }
+  channel:  { enum: [Paid Search, Organic, Email, Social, Direct] }
+  segment:  { column: customers.segment, enum: [New, Returning, VIP] }
+  status:   { column: orders.status, enum: [completed, returned, cancelled] }
+  order_date: { column: order_items.order_date, grain: day }
+  order_month:
+    description: order_date truncated to month
+    sql_azure: "CONVERT(char(7), order_date, 126)"   # 'YYYY-MM'
+    note: use the dialect-appropriate month truncation
+
+# Few-shot examples, written in the production dialect (Azure SQL / T-SQL).
+query_examples:
+  - q: What was total GMV last month (May 2026)?
+    sql: |
+      SELECT SUM(line_gmv) AS gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01';
+
+  - q: Did total GMV drop last month compared with the trailing three-month average?
+    sql: |
+      WITH last_m AS (
+        SELECT SUM(line_gmv) AS gmv
+        FROM dbo.order_items
+        WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      ),
+      baseline AS (
+        SELECT SUM(line_gmv) / 3.0 AS avg_monthly_gmv
+        FROM dbo.order_items
+        WHERE order_date >= '2026-02-01' AND order_date < '2026-05-01'
+      )
+      SELECT l.gmv AS last_month_gmv,
+             b.avg_monthly_gmv,
+             (l.gmv - b.avg_monthly_gmv)                     AS delta,
+             (l.gmv - b.avg_monthly_gmv) / b.avg_monthly_gmv AS pct_change
+      FROM last_m l CROSS JOIN baseline b;
+
+  - q: GMV by region for May 2026 versus the prior three months' average.
+    sql: |
+      WITH may AS (
+        SELECT region, SUM(line_gmv) AS may_gmv
+        FROM dbo.order_items
+        WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+        GROUP BY region
+      ),
+      trailing AS (
+        SELECT region, SUM(line_gmv) / 3.0 AS avg_gmv
+        FROM dbo.order_items
+        WHERE order_date >= '2026-02-01' AND order_date < '2026-05-01'
+        GROUP BY region
+      )
+      SELECT m.region, m.may_gmv, t.avg_gmv,
+             (m.may_gmv - t.avg_gmv)            AS delta,
+             (m.may_gmv - t.avg_gmv) / t.avg_gmv AS pct_change
+      FROM may m JOIN trailing t ON m.region = t.region
+      ORDER BY pct_change ASC;
+
+  - q: Which region and category drove the May 2026 decline?
+    sql: |
+      WITH may AS (
+        SELECT region, category, SUM(line_gmv) AS may_gmv
+        FROM dbo.order_items
+        WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+        GROUP BY region, category
+      ),
+      trailing AS (
+        SELECT region, category, SUM(line_gmv) / 3.0 AS avg_gmv
+        FROM dbo.order_items
+        WHERE order_date >= '2026-02-01' AND order_date < '2026-05-01'
+        GROUP BY region, category
+      )
+      SELECT m.region, m.category, (m.may_gmv - t.avg_gmv) AS delta
+      FROM may m JOIN trailing t
+        ON m.region = t.region AND m.category = t.category
+      ORDER BY delta ASC;
+
+  - q: ROAS by channel for May 2026.
+    sql: |
+      WITH g AS (
+        SELECT channel, SUM(line_gmv) AS gmv
+        FROM dbo.order_items
+        WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+        GROUP BY channel
+      ),
+      s AS (
+        SELECT channel, SUM(spend) AS spend
+        FROM dbo.marketing_spend
+        WHERE month = '2026-05-01'
+        GROUP BY channel
+      )
+      SELECT g.channel, g.gmv, s.spend,
+             g.gmv / NULLIF(s.spend, 0) AS roas
+      FROM g JOIN s ON g.channel = s.channel
+      ORDER BY roas DESC;
+
+  - q: List customers who churned with their contact details. (UC-C — PII)
+    sql: |
+      -- full_name, email, phone are PII (policy.pii_requires_entitlement).
+      -- For a NON-entitled role, withhold PII and return aggregates instead:
+      SELECT region, segment, COUNT(*) AS customers
+      FROM dbo.customers
+      GROUP BY region, segment;
+      -- PII columns (email, phone) are returned ONLY if the caller's role is
+      -- entitled; otherwise the agent must aggregate or mask. ("Churn" is
+      -- illustrative here; the synthetic data has no churn flag.)
+
+
+  - q: What was total GMV in 2025?
+    sql: |
+      SELECT SUM(line_gmv) AS gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01';
+
+  - q: How many units were sold in May 2026?
+    sql: |
+      SELECT SUM(quantity) AS units_sold
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01';
+
+  - q: How many orders were placed in 2025?
+    sql: |
+      SELECT COUNT(DISTINCT order_id) AS order_count
+      FROM dbo.orders
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01';
+
+  - q: What was the average order value (AOV) in May 2026?
+    sql: |
+      SELECT SUM(line_gmv) / COUNT(DISTINCT order_id) AS aov
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01';
+
+  - q: What was gross revenue before discounts in May 2026?
+    sql: |
+      SELECT SUM(quantity * unit_price) AS gross_revenue
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01';
+
+  - q: Show GMV by region for 2025.
+    sql: |
+      SELECT region, SUM(line_gmv) AS gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY region
+      ORDER BY gmv DESC;
+
+  - q: GMV by category in May 2026.
+    sql: |
+      SELECT category, SUM(line_gmv) AS gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      GROUP BY category
+      ORDER BY gmv DESC;
+
+  - q: GMV by channel in May 2026.
+    sql: |
+      SELECT channel, SUM(line_gmv) AS gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      GROUP BY channel
+      ORDER BY gmv DESC;
+
+  - q: Order count by region in 2025.
+    sql: |
+      SELECT region, COUNT(DISTINCT order_id) AS order_count
+      FROM dbo.orders
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY region
+      ORDER BY order_count DESC;
+
+  - q: Units sold by category in 2025.
+    sql: |
+      SELECT category, SUM(quantity) AS units_sold
+      FROM dbo.order_items
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY category
+      ORDER BY units_sold DESC;
+
+  - q: Top 5 categories by GMV in 2025.
+    sql: |
+      SELECT TOP 5 category, SUM(line_gmv) AS gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY category
+      ORDER BY gmv DESC;
+
+  - q: Which region had the lowest GMV in May 2026?
+    sql: |
+      SELECT TOP 1 region, SUM(line_gmv) AS gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      GROUP BY region
+      ORDER BY gmv ASC;
+
+  - q: Top 10 subcategories by GMV in 2025.
+    sql: |
+      SELECT TOP 10 p.subcategory, SUM(oi.line_gmv) AS gmv
+      FROM dbo.order_items oi
+      JOIN dbo.products p ON oi.product_id = p.product_id
+      WHERE oi.order_date >= '2025-01-01' AND oi.order_date < '2026-01-01'
+      GROUP BY p.subcategory
+      ORDER BY gmv DESC;
+
+  - q: Which category sold the most units in 2025?
+    sql: |
+      SELECT TOP 1 category, SUM(quantity) AS units_sold
+      FROM dbo.order_items
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY category
+      ORDER BY units_sold DESC;
+
+  - q: Monthly GMV trend for 2025.
+    sql: |
+      SELECT CONVERT(char(7), order_date, 126) AS order_month, SUM(line_gmv) AS gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY CONVERT(char(7), order_date, 126)
+      ORDER BY order_month;
+
+  - q: Monthly order count in 2025.
+    sql: |
+      SELECT CONVERT(char(7), order_date, 126) AS order_month, COUNT(DISTINCT order_id) AS order_count
+      FROM dbo.orders
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY CONVERT(char(7), order_date, 126)
+      ORDER BY order_month;
+
+  - q: Monthly GMV for the South region so far in 2026.
+    sql: |
+      SELECT CONVERT(char(7), order_date, 126) AS order_month, SUM(line_gmv) AS gmv
+      FROM dbo.order_items
+      WHERE region = 'South' AND order_date >= '2026-01-01' AND order_date < '2026-06-01'
+      GROUP BY CONVERT(char(7), order_date, 126)
+      ORDER BY order_month;
+
+  - q: Monthly units sold for Electronics in 2025.
+    sql: |
+      SELECT CONVERT(char(7), order_date, 126) AS order_month, SUM(quantity) AS units_sold
+      FROM dbo.order_items
+      WHERE category = 'Electronics' AND order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY CONVERT(char(7), order_date, 126)
+      ORDER BY order_month;
+
+  - q: How did GMV in May 2026 compare with April 2026?
+    sql: |
+      WITH may AS (
+        SELECT SUM(line_gmv) AS gmv FROM dbo.order_items
+        WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      ),
+      apr AS (
+        SELECT SUM(line_gmv) AS gmv FROM dbo.order_items
+        WHERE order_date >= '2026-04-01' AND order_date < '2026-05-01'
+      )
+      SELECT m.gmv AS may_gmv, a.gmv AS apr_gmv,
+             (m.gmv - a.gmv) AS delta,
+             (m.gmv - a.gmv) / NULLIF(a.gmv, 0) AS pct_change
+      FROM may m CROSS JOIN apr a;
+
+  - q: Electronics GMV in May 2026 versus its trailing three-month average.
+    sql: |
+      WITH may AS (
+        SELECT SUM(line_gmv) AS gmv FROM dbo.order_items
+        WHERE category = 'Electronics' AND order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      ),
+      baseline AS (
+        SELECT SUM(line_gmv) / 3.0 AS avg_gmv FROM dbo.order_items
+        WHERE category = 'Electronics' AND order_date >= '2026-02-01' AND order_date < '2026-05-01'
+      )
+      SELECT m.gmv AS may_gmv, b.avg_gmv,
+             (m.gmv - b.avg_gmv) / NULLIF(b.avg_gmv, 0) AS pct_change
+      FROM may m CROSS JOIN baseline b;
+
+  - q: GMV by region in May 2026 versus May 2025.
+    sql: |
+      WITH cur AS (
+        SELECT region, SUM(line_gmv) AS gmv FROM dbo.order_items
+        WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+        GROUP BY region
+      ),
+      prior AS (
+        SELECT region, SUM(line_gmv) AS gmv FROM dbo.order_items
+        WHERE order_date >= '2025-05-01' AND order_date < '2025-06-01'
+        GROUP BY region
+      )
+      SELECT c.region, c.gmv AS may_2026, p.gmv AS may_2025,
+             (c.gmv - p.gmv) / NULLIF(p.gmv, 0) AS yoy_pct_change
+      FROM cur c JOIN prior p ON c.region = p.region
+      ORDER BY yoy_pct_change ASC;
+
+  - q: What was total marketing spend in May 2026?
+    sql: |
+      SELECT SUM(spend) AS marketing_spend
+      FROM dbo.marketing_spend
+      WHERE month = '2026-05-01';
+
+  - q: Marketing spend by channel for May 2026.
+    sql: |
+      SELECT channel, SUM(spend) AS spend
+      FROM dbo.marketing_spend
+      WHERE month = '2026-05-01'
+      GROUP BY channel
+      ORDER BY spend DESC;
+
+  - q: What was overall ROAS in May 2026?
+    sql: |
+      WITH g AS (
+        SELECT SUM(line_gmv) AS gmv FROM dbo.order_items
+        WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      ),
+      s AS (
+        SELECT SUM(spend) AS spend FROM dbo.marketing_spend
+        WHERE month = '2026-05-01'
+      )
+      SELECT g.gmv, s.spend, g.gmv / NULLIF(s.spend, 0) AS roas
+      FROM g CROSS JOIN s;
+
+  - q: ROAS by region for May 2026.
+    sql: |
+      WITH g AS (
+        SELECT region, SUM(line_gmv) AS gmv FROM dbo.order_items
+        WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+        GROUP BY region
+      ),
+      s AS (
+        SELECT region, SUM(spend) AS spend FROM dbo.marketing_spend
+        WHERE month = '2026-05-01'
+        GROUP BY region
+      )
+      SELECT g.region, g.gmv / NULLIF(s.spend, 0) AS roas
+      FROM g JOIN s ON g.region = s.region
+      ORDER BY roas DESC;
+
+  - q: Which channel had the lowest ROAS in May 2026?
+    sql: |
+      WITH g AS (
+        SELECT channel, SUM(line_gmv) AS gmv FROM dbo.order_items
+        WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+        GROUP BY channel
+      ),
+      s AS (
+        SELECT channel, SUM(spend) AS spend FROM dbo.marketing_spend
+        WHERE month = '2026-05-01'
+        GROUP BY channel
+      )
+      SELECT TOP 1 g.channel, g.gmv / NULLIF(s.spend, 0) AS roas
+      FROM g JOIN s ON g.channel = s.channel
+      ORDER BY roas ASC;
+
+  - q: Stockout days by region and category in May 2026.
+    sql: |
+      SELECT region, category, COUNT(*) AS stockout_days
+      FROM dbo.inventory_snapshots
+      WHERE units_in_stock = 0 AND snapshot_date >= '2026-05-01' AND snapshot_date < '2026-06-01'
+      GROUP BY region, category
+      ORDER BY stockout_days DESC;
+
+  - q: Which region and category had the most stockout days in May 2026?
+    sql: |
+      SELECT TOP 1 region, category, COUNT(*) AS stockout_days
+      FROM dbo.inventory_snapshots
+      WHERE units_in_stock = 0 AND snapshot_date >= '2026-05-01' AND snapshot_date < '2026-06-01'
+      GROUP BY region, category
+      ORDER BY stockout_days DESC;
+
+  - q: Average units in stock by category in May 2026.
+    sql: |
+      SELECT category, AVG(CAST(units_in_stock AS float)) AS avg_units_in_stock
+      FROM dbo.inventory_snapshots
+      WHERE snapshot_date >= '2026-05-01' AND snapshot_date < '2026-06-01'
+      GROUP BY category
+      ORDER BY avg_units_in_stock;
+
+  - q: How many days was South Electronics out of stock in May 2026?
+    sql: |
+      SELECT COUNT(*) AS stockout_days
+      FROM dbo.inventory_snapshots
+      WHERE region = 'South' AND category = 'Electronics' AND units_in_stock = 0
+        AND snapshot_date >= '2026-05-01' AND snapshot_date < '2026-06-01';
+
+  - q: Return rate by region in 2025.
+    sql: |
+      SELECT region, AVG(CASE WHEN status = 'returned' THEN 1.0 ELSE 0 END) AS return_rate
+      FROM dbo.orders
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY region
+      ORDER BY return_rate DESC;
+
+  - q: How many orders were cancelled in May 2026?
+    sql: |
+      SELECT COUNT(*) AS cancelled_orders
+      FROM dbo.orders
+      WHERE status = 'cancelled' AND order_date >= '2026-05-01' AND order_date < '2026-06-01';
+
+  - q: Completed versus returned order counts in 2025.
+    sql: |
+      SELECT status, COUNT(*) AS orders
+      FROM dbo.orders
+      WHERE status IN ('completed', 'returned') AND order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY status;
+
+  - q: Average discount by category in May 2026.
+    sql: |
+      SELECT category, AVG(discount) AS avg_discount
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      GROUP BY category
+      ORDER BY avg_discount DESC;
+
+  - q: How much did discounts reduce revenue in May 2026?
+    sql: |
+      SELECT SUM(quantity * unit_price) AS gross_revenue,
+             SUM(line_gmv) AS net_gmv,
+             SUM(quantity * unit_price) - SUM(line_gmv) AS discount_amount
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01';
+
+  - q: GMV by customer segment in 2025.
+    sql: |
+      SELECT c.segment, SUM(oi.line_gmv) AS gmv
+      FROM dbo.order_items oi
+      JOIN dbo.orders o ON oi.order_id = o.order_id
+      JOIN dbo.customers c ON o.customer_id = c.customer_id
+      WHERE oi.order_date >= '2025-01-01' AND oi.order_date < '2026-01-01'
+      GROUP BY c.segment
+      ORDER BY gmv DESC;
+
+  - q: Order count by customer segment in 2025.
+    sql: |
+      SELECT c.segment, COUNT(DISTINCT o.order_id) AS order_count
+      FROM dbo.orders o
+      JOIN dbo.customers c ON o.customer_id = c.customer_id
+      WHERE o.order_date >= '2025-01-01' AND o.order_date < '2026-01-01'
+      GROUP BY c.segment
+      ORDER BY order_count DESC;
+
+  - q: How many customers are in each region and segment?
+    sql: |
+      SELECT region, segment, COUNT(*) AS customers
+      FROM dbo.customers
+      GROUP BY region, segment
+      ORDER BY region, segment;
+
+  - q: Each region's share of total GMV in May 2026.
+    sql: |
+      SELECT region,
+             SUM(line_gmv) AS gmv,
+             SUM(line_gmv) * 1.0 / SUM(SUM(line_gmv)) OVER () AS gmv_share
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      GROUP BY region
+      ORDER BY gmv DESC;
+
+  - q: Running monthly GMV total through 2025.
+    sql: |
+      SELECT CONVERT(char(7), order_date, 126) AS order_month,
+             SUM(line_gmv) AS monthly_gmv,
+             SUM(SUM(line_gmv)) OVER (ORDER BY CONVERT(char(7), order_date, 126) ROWS UNBOUNDED PRECEDING) AS running_gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY CONVERT(char(7), order_date, 126)
+      ORDER BY order_month;
+
+  - q: Rank categories by GMV in May 2026.
+    sql: |
+      SELECT category,
+             SUM(line_gmv) AS gmv,
+             RANK() OVER (ORDER BY SUM(line_gmv) DESC) AS gmv_rank
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      GROUP BY category
+      ORDER BY gmv_rank;
+
+  - q: How many distinct customers placed an order in May 2026?
+    sql: |
+      SELECT COUNT(DISTINCT customer_id) AS active_customers
+      FROM dbo.orders
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01';
+
+  - q: Category mix as a percentage of GMV in May 2026.
+    sql: |
+      SELECT category,
+             SUM(line_gmv) AS gmv,
+             100.0 * SUM(line_gmv) / SUM(SUM(line_gmv)) OVER () AS pct_of_gmv
+      FROM dbo.order_items
+      WHERE order_date >= '2026-05-01' AND order_date < '2026-06-01'
+      GROUP BY category
+      ORDER BY gmv DESC;
+
+  - q: Top 3 regions by units sold in 2025.
+    sql: |
+      SELECT TOP 3 region, SUM(quantity) AS units_sold
+      FROM dbo.order_items
+      WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+      GROUP BY region
+      ORDER BY units_sold DESC;

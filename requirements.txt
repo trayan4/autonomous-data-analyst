@@ -1,0 +1,33 @@
+# Dependencies are declared in pyproject.toml. Install the package instead:
+#   pip install -e .                     # core runtime (agent graph + eval)
+#   pip install -e ".[data]"             # + synthetic data generation / bulk load
+#   pip install -e ".[azure]" --pre      # + Azure Monitor trace export (ADA_TRACE=azure)
+# This file installs the core runtime for tooling that expects a requirements.txt:
+-e .
+
+
+# ---- Autonomous Data Analyst: all Python deps (single root file) ----
+
+# data generation
+numpy>=1.26
+pandas>=2.0
+faker>=24.0
+
+# semantic layer / eval / config
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# sql safety gate + model client
+sqlglot>=25.0
+openai>=1.40
+
+# azure sql connectivity (data load + query executor)
+pyodbc>=5.0
+
+# orchestration (Phase 4)
+langgraph>=0.2
+
+# observability (Phase 5): OpenTelemetry tracing. Azure Monitor export added in Part 3.
+opentelemetry-sdk>=1.20
+# needed when ADA_TRACE=azure (ship spans to Application Insights):
+azure-monitor-opentelemetry-exporter>=1.0.0b53
